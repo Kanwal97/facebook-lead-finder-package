@@ -1,0 +1,215 @@
+# ── Your profile ─────────────────────────────────────────────────────────
+# The model reads this to decide which groups and posts are a good fit.
+profile:
+  name: Kanwaljeet Singh
+  portfolio: https://kanwal97.github.io/
+  headline: Full-stack engineer, 7+ years, 34 shipped client projects
+  services:
+    - Full-stack web apps (Laravel/PHP, NestJS/Node, Next.js/React, Vue, Angular)
+    - AI/LLM integration (OpenAI, Claude, embeddings, semantic search, RAG)
+    - E-commerce & payments (Medusa, Aimeos, WooCommerce, Shopify apps, Stripe, PayPal, Razorpay)
+    - Mobile apps (Flutter, Ionic, Firebase)
+    - APIs, scrapers, webhooks, automation (Playwright, queues, WebSockets)
+    - SaaS MVPs delivered fast (e.g. decision-support terminal in 21 days)
+  industries:
+    - SaaS
+    - e-commerce
+    - fintech / payments
+    - marketplaces
+    - real estate
+    - food delivery
+    - fitness / health
+    - job portals
+  engagement: contract, freelance, or long-term; replies within 24h; UTC+5:30
+  not_a_fit:
+    - pure graphic design / branding
+    - game development
+    - blockchain / smart contracts
+    - unpaid or "equity only" work
+    - roles requiring on-site presence outside India
+
+# ── AI: local open-source model via an OpenAI-compatible server ──────────
+# Default is Ollama (https://ollama.com). Also works with LM Studio
+# (http://localhost:1234/v1), llama.cpp server (http://localhost:8080/v1) or vLLM.
+# Environment variables LLM_BASE_URL, LLM_MODEL, LLM_API_KEY override these.
+ai:
+  # Ollama runs on another machine: use its LAN address, e.g. http://192.168.1.50:11434/v1
+  # On that machine Ollama must listen on all interfaces: OLLAMA_HOST=0.0.0.0 ollama serve
+  base_url: http://localhost:11434/v1
+  model: qwen3:4b              # ollama pull qwen3:4b   (~2.6 GB, fits in 8 GB RAM)
+  api_key: null                # only if your server needs one (Ollama ignores it)
+  max_tokens: 800
+  temperature: 0.2
+  timeout: 300                 # seconds; CPU inference can take a minute per post
+  json_mode: true              # sends response_format=json_object; set false if your server rejects it
+  extra_body:
+    reasoning_effort: none     # Ollama: turns off Qwen3/DeepSeek "thinking", which is slow on CPU.
+                               # Remove this line for LM Studio / llama.cpp if they reject it.
+
+# ── Keyword gate: cheap pre-filter before the slow model sees a post ─────
+gate:
+  require_any:                 # a post must contain at least one of these
+    # explicit asks
+    - looking for
+    - need
+    - hire
+    - hiring
+    - budget
+    - build
+    - quote
+    - paid
+    - develop
+    - recommend
+    # described problems
+    - how do i
+    - how to
+    - how can i
+    - is there a way
+    - any way to
+    - anyone know
+    - any tool
+    - which tool
+    - which app
+    - struggling
+    - manually
+    - automate
+    - automation
+    - spreadsheet
+    - excel
+    - integrat
+    - sync
+    - export
+    - import
+    - scrape
+    - script
+    - bot
+    - api
+    - workflow
+    - tedious
+    - takes hours
+    - every day
+    - not working
+    - broken
+    - error
+    - crm
+    - inventory
+    - orders
+    - leads
+    - website
+    - plugin
+    - app
+  skip_if_contains:            # obvious self-promotion, never worth scoring
+    - for hire
+    - my services
+    - i am a developer
+    - i'm a developer
+    - i am a freelancer
+    - i'm a freelancer
+    - hire me
+    - dm me for
+    - dm me
+    - inbox me
+    - my portfolio
+    - my students
+    - my student
+    - my mentees
+    - my clients have
+    - my clients are
+    - one of my clients
+    - just reached
+    - just hit $
+    - just made $
+    - just crossed
+    - case study
+    - free training
+    - free course
+    - free masterclass
+    - free webinar
+    - coaching program
+    - mentorship program
+    - join my
+    - book a call
+    - spots left
+    - link in bio
+    - link in comments
+    - passive income
+    - guaranteed results
+    - comment "
+    - comment '
+    - of your profits
+    - no scams
+    - generate income
+    - beta testers
+    - check out my
+    - fiverr
+    - i help small business
+    - looking for a partner
+    - ugc creators
+    - free spots
+    - mindset
+    - appointment setter
+
+# ── Filters shared by discovery: skip groups whose card contains these ───
+filters:
+  junk_keywords:
+    - buy and sell
+    - buy/sell
+    - buy sell
+    - marketplace
+    - for sale
+    - giveaway
+    - crypto
+    - nft
+    - forex
+    - trading
+    - make money
+    - online income
+    - passive income
+    - work from home
+    - earn from home
+    - mlm
+    - network marketing
+    - memes
+    - gaming
+    - dating
+
+# ── Facebook ─────────────────────────────────────────────────────────────
+# Automating a personal Facebook account is against Facebook's terms. The
+# pacing below keeps the tool slow and human-paced, which lowers the chance
+# of a checkpoint but does not remove it. Keep the limits modest.
+facebook:
+  db_path: leads.db                      # relative to this file
+  mode: assist                           # assist: you scroll, the tool reads. auto: it scrolls, slowly.
+  pacing:
+    warmup_until: 2026-11-14             # counts halved until this date, so a fresh profile starts gently
+    groups_per_run: 6
+    runs_per_day: 3
+    min_hours_between_runs: 3
+    page_loads_per_day: 25
+    active_hours: [9, 22]
+  read:
+    max_post_age_days: 14
+    min_text_chars: 40
+  lead:
+    min_score: 50
+  discovery:
+    searches_per_day: 4
+    min_members: 2000
+    min_group_score: 60
+    # Facebook group search is literal, so describe the audience, not the problem.
+    queries:
+      - shopify store owners
+      - ecommerce entrepreneurs
+      - woocommerce store owners
+      - amazon fba sellers
+      - etsy sellers
+      - saas founders
+      - startup founders
+      - small business owners
+      - digital marketing agency owners
+      - real estate investors
+      - restaurant owners
+      - online coaches and course creators
+      - hire web developers
+      - freelance web development jobs
+    junk_keywords: []                    # merged with filters.junk_keywords above

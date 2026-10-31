@@ -1,4 +1,4 @@
-"""Load the facebook: section of config.yaml.
+"""Load config.yaml from the project root.
 
 Defaults live here so a key missing from the YAML falls back to a slow,
 safe value instead of crashing mid-run or running unthrottled.
@@ -11,9 +11,11 @@ from pathlib import Path
 
 import yaml
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = ROOT / "config.yaml"
 
 DEFAULTS: dict = {
+    "db_path": "leads.db",
     "profile_dir": "~/.local/share/lead-finder/fb-profile",
     "debug_dir": "debug/facebook",
     "cooldown_file": "~/.local/state/lead-finder/fb-cooldown",
@@ -65,6 +67,19 @@ DEFAULTS: dict = {
     },
 }
 
+AI_DEFAULTS: dict = {
+    "base_url": "http://localhost:11434/v1",
+    "model": "qwen3:4b",
+    "api_key": None,
+    "max_tokens": 800,
+    "temperature": 0.2,
+    "timeout": 300,
+    "json_mode": True,
+    "extra_body": {"reasoning_effort": "none"},
+}
+
+GATE_DEFAULTS: dict = {"require_any": [], "skip_if_contains": []}
+
 # Counts halved during warm-up. Pauses are left alone: slower is never riskier.
 WARMUP_HALVED = ("groups_per_run", "runs_per_day", "page_loads_per_day",
                  "posts_per_group", "scrolls_per_group")
@@ -88,18 +103,26 @@ def _as_date(value) -> dt.date | None:
 
 
 def load(path: Path = CONFIG_PATH, today: dt.date | None = None) -> dict:
-    raw = yaml.safe_load(Path(path).read_text()) or {}
+    path = Path(path)
+    if not path.exists():
+        raise SystemExit(f"No config file at {path}. Copy config.example.yaml to config.yaml "
+                         "and fill in your profile.")
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     cfg = _merge(DEFAULTS, raw.get("facebook"))
 
-    # Shared sections: one profile text and one junk list serve both platforms.
-    cfg["profile"] = raw.get("profile", {})
-    shared_junk = (raw.get("filters") or {}).get("junk_keywords", [])  # TODO(wire): real key
+    # Top-level sections shared by every command.
+    cfg["profile"] = raw.get("profile") or {}
+    cfg["ai"] = _merge(AI_DEFAULTS, raw.get("ai"))
+    cfg["gate"] = _merge(GATE_DEFAULTS, raw.get("gate"))
+    shared_junk = (raw.get("filters") or {}).get("junk_keywords") or []
     cfg["discovery"]["junk_keywords"] = sorted(
         {w.lower() for w in shared_junk} | {w.lower() for w in cfg["discovery"]["junk_keywords"]}
     )
 
-    for key in ("profile_dir", "debug_dir", "cooldown_file"):
-        cfg[key] = Path(cfg[key]).expanduser()
+    # Relative paths are relative to the project root, not the shell's directory.
+    for key in ("db_path", "profile_dir", "debug_dir", "cooldown_file"):
+        value = Path(cfg[key]).expanduser()
+        cfg[key] = value if value.is_absolute() else path.parent / value
 
     warmup = _as_date(cfg["pacing"]["warmup_until"])
     if warmup and (today or dt.date.today()) < warmup:

@@ -38,29 +38,36 @@ def todays_queries(cfg: dict, n: int) -> list[str]:
     """Rotate through the list by date, so every query gets a turn without
     storing anything and no query is searched twice in a row."""
     queries = cfg["discovery"]["queries"]
-    if not queries:
+    if not queries or n <= 0:
         return []
     offset = (dt.date.today().toordinal() * n) % len(queries)
     return [queries[(offset + i) % len(queries)] for i in range(min(n, len(queries)))]
 
 
 def keep_card(card: dict, cfg: dict) -> tuple[bool, str | None]:
+    """(keep, reason). 'unparsed' cards are never stored: the member-count
+    line did not match, which usually means the card layout changed, and a
+    group must not be ignored for good over a parsing miss."""
     d = cfg["discovery"]
     hit = groups.junk_hit(f"{card['name']} {card['text']}", d["junk_keywords"])
     if hit:
         return False, f"junk:{hit}"
-    if (card.get("member_count") or 0) < d["min_members"]:
+    if card.get("member_count") is None:
+        return False, "unparsed"
+    if card["member_count"] < d["min_members"]:
         return False, "small"
     return True, None
 
 
 def run(cfg: dict, dry_run: bool = False) -> str:
-    conn = adapters.connect()
-    store.migrate(conn, (adapters.LEADS_TABLE, adapters.REJECTED_TABLE))
+    conn = adapters.connect(cfg)
+    store.migrate(conn)
     usage = store.usage_today(conn)
     reason = pacing.guard(cfg, usage, "discover", session.cooldown_until(cfg))
     if reason:
         return f"Not searching: {reason}."
+    if not cfg["discovery"]["queries"]:
+        return "No search queries. Add some under facebook.discovery.queries in config.yaml."
 
     budget = cfg["discovery"]["searches_per_day"] - usage["searches"]
     run_id = store.start_run(conn, "discover")
@@ -72,12 +79,14 @@ def run(cfg: dict, dry_run: bool = False) -> str:
             for i, query in enumerate(todays_queries(cfg, budget)):
                 if i:
                     page.wait_for_timeout(pacing.seconds(cfg["discovery"]["search_pause_s"]) * 1000)
+                print(f"searching: {query}")
                 found += search_once(page, conn, run_id, query, cfg)
         except session.Blocked as blocked:
             stop = f"blocked:{blocked.reason}"
             session.screenshot(page, cfg, stop)
             if blocked.cooldown:
-                session.set_cooldown(cfg, blocked.reason)
+                until = session.set_cooldown(cfg, blocked.reason)
+                print(f"Stopped: Facebook signal '{blocked.reason}'. No runs until {until:%a %d %b %H:%M}.")
         except KeyboardInterrupt:
             stop = "user"
         finally:
@@ -90,8 +99,8 @@ def run(cfg: dict, dry_run: bool = False) -> str:
     for card in found:
         keep, why = keep_card(card, cfg)
         print(f"{'+' if keep else '-'} {card['name']} ({card.get('member_count')}) {why or ''}")
-        if not dry_run:
-            # Junk is stored as ignored so later searches never reconsider it.
+        if not dry_run and why != "unparsed":
+            # Junk and small groups are stored as ignored so later searches never reconsider them.
             new += store.upsert_group(conn, card, status="candidate" if keep else "ignored")
 
     if not dry_run:
@@ -125,12 +134,24 @@ def search_once(page, conn, run_id: int, query: str, cfg: dict) -> list[dict]:
 
 def score_candidates(conn, cfg: dict) -> None:
     """Model calls are rare and slow (about 45 s), so only unscored
-    candidates that passed the filters, capped per run, biggest first."""
+    candidates that passed the filters, capped per run, biggest first.
+    Unscored candidates stay unscored and are picked up by the next run."""
     d = cfg["discovery"]
-    for group in store.unscored_candidates(conn, d["group_scores_per_run"]):
+    pending = store.unscored_candidates(conn, d["group_scores_per_run"])
+    if not pending:
+        return
+    problem = adapters.model_ready(cfg)
+    if problem:
+        print(f"Skipping group scoring: {problem}. Run discover again once it is up.")
+        return
+    for group in pending:
         about = f"{group.get('privacy') or ''} group, {group.get('member_count') or '?'} members, " \
                 f"{group.get('activity') or 'activity unknown'}. Found by searching '{group.get('source_query')}'."
-        result = adapters.score_group(group["name"], about)
+        try:
+            result = adapters.score_group(group["name"], about, cfg)
+        except Exception as exc:
+            print(f"  scoring failed for {group['name']}: {exc}")
+            continue
         store.update_group(conn, group["group_id"], score=result["score"],
                            score_reason=result.get("reason"))
         print(f"  {result['score']:>3}  {group['name']}")

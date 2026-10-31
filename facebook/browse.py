@@ -8,8 +8,8 @@ calls cost no extra time on the page.
 from __future__ import annotations
 
 import random
-import select
 import sys
+import threading
 import time
 
 from playwright.sync_api import sync_playwright
@@ -19,9 +19,38 @@ from .feed import reached_known, select_new
 from .graphql import FeedCapture, Post
 
 
+class EnterWatcher:
+    """Lets the Playwright loop poll for Enter without blocking.
+
+    select() on stdin only works on Unix and input() would stall the event
+    pump that delivers GraphQL responses, so a daemon thread reads stdin and
+    raises a flag. Start it only after the last input() prompt of the run.
+    """
+
+    def __init__(self):
+        self._pressed = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _read(self) -> None:
+        while sys.stdin.readline():
+            self._pressed.set()
+
+    def arm(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._read, daemon=True)
+            self._thread.start()
+        self._pressed.clear()
+
+    def pressed(self) -> bool:
+        return self._pressed.is_set()
+
+
+_enter = EnterWatcher()
+
+
 def run(cfg: dict, mode: str, only_group: str | None = None, force: bool = False) -> str:
-    conn = adapters.connect()
-    store.migrate(conn, (adapters.LEADS_TABLE, adapters.REJECTED_TABLE))
+    conn = adapters.connect(cfg)
+    store.migrate(conn)
     reason = pacing.guard(cfg, store.usage_today(conn), "browse", session.cooldown_until(cfg))
     if reason and not (force and "cooling" not in reason):  # --force never skips a cooldown
         return f"Not browsing: {reason}."
@@ -31,6 +60,12 @@ def run(cfg: dict, mode: str, only_group: str | None = None, force: bool = False
     targets = [g for g in targets if g]
     if not targets:
         return "No approved groups to browse. Add some with: python -m facebook groups add <url>"
+
+    # Posts are scored during the run and the watermark moves on, so a dead
+    # model would mean posts read now are never scored. Check before opening.
+    problem = adapters.model_ready(cfg)
+    if problem:
+        return f"Not browsing: {problem}."
 
     run_id = store.start_run(conn, "browse", mode)
     backlog: list[tuple[dict, Post]] = []
@@ -63,10 +98,12 @@ def run(cfg: dict, mode: str, only_group: str | None = None, force: bool = False
             except Exception:
                 pass  # Ctrl+C may already have taken the browser down
 
-    for group, post in backlog:  # browser closed: finish scoring off the page
-        handle_post(conn, group, post, cfg)
+    if backlog:
+        print(f"Browser closed. Scoring {len(backlog)} post(s) left over...")
+    for group, post in backlog:
+        score_safely(conn, group, post, cfg)
     store.end_run(conn, run_id, stop)
-    return f"Browse run ended: {stop}."
+    return f"Browse run ended: {stop}. See leads with: python -m facebook leads --new"
 
 
 def read_group(page, capture: FeedCapture, conn, run_id: int, group: dict,
@@ -82,6 +119,7 @@ def read_group(page, capture: FeedCapture, conn, run_id: int, group: dict,
     store.update_group(conn, gid, membership=state,
                        **({"name": title} if title and group["name"] == gid else {}))
     if state not in groups.READABLE:
+        store.mark_browsed(conn, gid, None)  # counts as a visit, so the rotation moves on
         print(f"[{group['name']}] {state}: skipped")
         return []
 
@@ -124,6 +162,7 @@ def read_assisted(page, capture: FeedCapture, group: dict, cfg: dict) -> None:
     limit = cfg["pacing"]["assist_minutes_per_group"] * 60
     print(f"[{group['name']}] scroll this group yourself. Press Enter when done "
           f"(moves on by itself after {limit // 60} min or once it reaches posts already read).")
+    _enter.arm()
     deadline = time.monotonic() + limit
     while time.monotonic() < deadline:
         page.wait_for_timeout(2000)  # keeps Playwright delivering responses
@@ -133,8 +172,7 @@ def read_assisted(page, capture: FeedCapture, group: dict, cfg: dict) -> None:
         if reached_known(capture.posts, group, cfg):
             print("  reached posts already read")
             break
-        if select.select([sys.stdin], [], [], 0)[0]:  # Linux: Enter pressed?
-            sys.stdin.readline()
+        if _enter.pressed():
             break
 
 
@@ -144,16 +182,25 @@ def pause_and_score(page, conn, backlog, cfg) -> list:
     start = time.monotonic()
     while backlog and time.monotonic() - start < target:
         group, post = backlog.pop(0)
-        handle_post(conn, group, post, cfg)
+        score_safely(conn, group, post, cfg)
     left = target - (time.monotonic() - start)
     if left > 0:
         page.wait_for_timeout(left * 1000)
     return backlog
 
 
+def score_safely(conn, group: dict, post: Post, cfg: dict) -> str:
+    """One model failure must not drop the rest of the backlog."""
+    try:
+        return handle_post(conn, group, post, cfg)
+    except Exception as exc:
+        print(f"  scoring failed for post {post.post_id}: {exc}")
+        return "error"
+
+
 def handle_post(conn, group: dict, post: Post, cfg: dict) -> str:
     text = post.text.strip()
-    if not adapters.passes_gate(text):
+    if not adapters.passes_gate(text, cfg):
         return "gated"
     digest = adapters.text_hash(text)
     result = adapters.prior_score(conn, digest)  # reposts: no model call
@@ -165,10 +212,11 @@ def handle_post(conn, group: dict, post: Post, cfg: dict) -> str:
             age = f", {max(0, int((time.time() - post.created_at) // 3600))} h ago"
         context = (f"Facebook group '{group['name']}'"
                    f" ({group.get('member_count') or '?'} members). "
-                   f"Post by {post.author_name or 'unknown'}{age}.")
-        result = adapters.score_post(text, context)
+                   f"Post by {post.author_name or 'unknown'}{age}")
+        result = adapters.score_post(text, context, cfg)
     if result["score"] >= cfg["lead"]["min_score"]:
         adapters.save_lead(conn, digest=digest, post=post, group_name=group["name"], result=result)
+        print(f"  lead {result['score']:>3} {result.get('intent', ''):<14} {text[:70]!r}")
         return "lead"
     adapters.save_rejected(conn, digest=digest, post=post, group_name=group["name"], result=result)
     return "rejected"

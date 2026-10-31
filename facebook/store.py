@@ -1,4 +1,4 @@
-"""Facebook tables, the platform migration, and the run ledger.
+"""SQLite: groups, leads, rejected posts and the run ledger.
 
 Daily budgets are counted from fb_runs rather than kept in memory, so they
 hold across crashes, restarts and several runs in one day.
@@ -8,8 +8,9 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 import time
+from pathlib import Path
 
-FB_SCHEMA = """
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS fb_groups (
   group_id          TEXT PRIMARY KEY,
   name              TEXT NOT NULL,
@@ -38,32 +39,60 @@ CREATE TABLE IF NOT EXISTS fb_runs (
   posts_seen  INTEGER DEFAULT 0,
   stop_reason TEXT
 );
+CREATE TABLE IF NOT EXISTS leads (
+  id          INTEGER PRIMARY KEY,
+  platform    TEXT NOT NULL DEFAULT 'facebook',
+  post_id     TEXT UNIQUE,
+  text_hash   TEXT,
+  group_name  TEXT,
+  author_name TEXT,
+  author_url  TEXT,
+  text        TEXT,
+  url         TEXT,
+  posted_at   INTEGER,
+  score       INTEGER,
+  intent      TEXT,
+  reason      TEXT,
+  draft       TEXT,
+  status      TEXT DEFAULT 'new',   -- new | replied | won | lost | ignored
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER
+);
+-- Posts the model scored below the lead threshold. Only the hash and the
+-- score are kept, so the same text is never scored twice and nothing
+-- personal is stored for posts that are not leads.
+CREATE TABLE IF NOT EXISTS rejected (
+  text_hash   TEXT PRIMARY KEY,
+  post_id     TEXT,
+  score       INTEGER,
+  intent      TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_leads_hash ON leads(text_hash);
+CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
 """
 RUN_COUNTERS = {"page_loads", "searches", "posts_seen"}
+LEAD_STATUSES = ("new", "replied", "won", "lost", "ignored")
 
 
 def now() -> int:
     return int(time.time())
 
 
+def connect(path: Path) -> sqlite3.Connection:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(str(path))
+
+
 def _rows(conn, sql: str, args=()) -> list[dict]:
     cur = conn.cursor()
-    cur.row_factory = sqlite3.Row  # on this cursor only; Discord code keeps its tuples
+    cur.row_factory = sqlite3.Row
     return [dict(row) for row in cur.execute(sql, args)]
 
 
-def _has_column(conn, table: str, column: str) -> bool:
-    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
-
-
-def migrate(conn, lead_tables=("leads", "rejected")) -> None:
-    """Safe to run every start: SQLite has no ADD COLUMN IF NOT EXISTS."""
-    for table in lead_tables:
-        if not _has_column(conn, table, "platform"):
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN platform TEXT NOT NULL DEFAULT 'discord'")
-    conn.executescript(FB_SCHEMA)
-    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{lead_tables[0]}_platform "
-                 f"ON {lead_tables[0]}(platform)")
+def migrate(conn) -> None:
+    """Safe to run every start: every statement is IF NOT EXISTS."""
+    conn.executescript(SCHEMA)
     conn.commit()
 
 
@@ -117,6 +146,11 @@ def update_group(conn, group_id: str, **fields) -> None:
 
 
 def mark_browsed(conn, group_id: str, newest) -> None:
+    """Record the visit; move the watermark forward if a dated post was read.
+
+    Called for skipped groups too (newest=None), so a group whose probe fails
+    does not stay at the front of the rotation forever.
+    """
     conn.execute("UPDATE fb_groups SET last_browsed_at = ? WHERE group_id = ?", (now(), group_id))
     if newest is not None and newest.created_at:
         conn.execute(
@@ -124,6 +158,56 @@ def mark_browsed(conn, group_id: str, newest) -> None:
             "WHERE group_id = ? AND COALESCE(last_seen_time, 0) < ?",
             (newest.post_id, newest.created_at, group_id, newest.created_at))
     conn.commit()
+
+
+# ---- leads ----------------------------------------------------------------
+
+def find_scored(conn, digest: str) -> dict | None:
+    """Earlier result for identical text, as a lead or a reject, else None."""
+    for table in ("leads", "rejected"):
+        rows = _rows(conn, f"SELECT score, intent FROM {table} WHERE text_hash = ? LIMIT 1", (digest,))
+        if rows:
+            return rows[0]
+    return None
+
+
+def save_lead(conn, *, digest: str, post, group_name: str, result: dict,
+              platform: str = "facebook") -> bool:
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO leads (platform, post_id, text_hash, group_name, author_name, "
+        "author_url, text, url, posted_at, score, intent, reason, draft, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (platform, post.post_id, digest, group_name, post.author_name, post.author_url,
+         post.text, post.url, post.created_at, result["score"], result.get("intent"),
+         result.get("reason"), result.get("draft"), now(), now()))
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def save_rejected(conn, *, digest: str, post, result: dict) -> None:
+    conn.execute("INSERT OR IGNORE INTO rejected (text_hash, post_id, score, intent, created_at) "
+                 "VALUES (?,?,?,?,?)",
+                 (digest, post.post_id, result["score"], result.get("intent"), now()))
+    conn.commit()
+
+
+def list_leads(conn, new_only: bool = False, min_score: int = 0, limit: int = 50) -> list[dict]:
+    sql = "SELECT * FROM leads WHERE score >= ?"
+    args: list = [min_score]
+    if new_only:
+        sql += " AND status = 'new'"
+    sql += " ORDER BY score DESC, created_at DESC LIMIT ?"
+    args.append(limit)
+    return _rows(conn, sql, args)
+
+
+def set_lead_status(conn, lead_id: int, status: str) -> bool:
+    if status not in LEAD_STATUSES:
+        raise ValueError(f"status must be one of {', '.join(LEAD_STATUSES)}")
+    cur = conn.execute("UPDATE leads SET status = ?, updated_at = ? WHERE id = ?",
+                       (status, now(), lead_id))
+    conn.commit()
+    return cur.rowcount == 1
 
 
 # ---- run ledger -----------------------------------------------------------
