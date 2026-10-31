@@ -179,7 +179,7 @@ filters:
 # of a checkpoint but does not remove it. Keep the limits modest.
 facebook:
   db_path: leads.db                      # relative to this file
-  mode: assist                           # assist: you scroll, the tool reads. auto: it scrolls, slowly.
+  mode: auto                             # auto: it scrolls, slowly, unattended. assist: you scroll, the tool reads.
   pacing:
     warmup_until: 2026-11-14             # counts halved until this date, so a fresh profile starts gently
     groups_per_run: 6
